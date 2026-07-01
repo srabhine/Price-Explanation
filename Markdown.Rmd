@@ -1,0 +1,1205 @@
+---
+title: "Modélisation et Explication des Prix de l'Électricité en Europe"
+author: "Sammy RABHINE"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: flatly
+    highlight: tango
+    toc: true
+    toc_float: true
+    code_folding: hide
+    number_sections: true
+  pdf_document:
+    toc: true
+subtitle: Analyse des marchés Spot France & Allemagne (Challenge QRT)
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, 
+  warning = FALSE, 
+  message = FALSE, 
+  fig.align = "center",
+  fig.width = 9,    # Largeur par défaut pour tout le rapport
+  fig.height = 6,    # Hauteur par défaut
+  out.width = "90%"  
+)
+
+# Chargement des librairies
+library(tidyverse)
+library(caret)
+library(xgboost)
+library(knitr)
+library(corrplot)
+library(plotly)
+library(FactoMineR)
+library(factoextra)
+library(kableExtra)
+library(dplyr)
+library(zoo)
+library(cluster)
+library(uwot)      
+library(factoextra)
+library(fmsb)
+
+# Palette de couleurs globale
+cols_pays <- c("France" = "#3498db", "Allemagne" = "#e74c3c")
+```
+
+
+# Introduction 
+
+Comment expliquer les variations journalières du prix des futures d’électricité en France et en Allemagne à partir de facteurs météorologiques, énergétiques et d’échanges transfrontaliers ?
+
+
+# Traitements des données
+
+Affichage des 5 premières lignes de mon dataset
+
+```{r Analyse Exploratoire}
+
+# Chargement des données
+X_train <- read_csv("X_train.csv")
+y_train <- read_csv("y_train.csv")
+X_test  <- read_csv("X_test_final.csv")
+
+### Aperçu des données et Structure
+# Affichage des 5 premières lignes
+X_train %>%
+  head(5) %>%
+  kable(caption = "Aperçu des 5 premières lignes du jeu de données d'entraînement") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = F) %>%
+  scroll_box(width = "100%")
+
+# Vérification des types de variables
+type_info <- data.frame(
+  Variable = names(X_train),
+  Type = sapply(X_train, class)
+)
+
+type_info %>%
+  count(Type) %>%
+  kable(caption = "Répartition des types de variables") %>%
+  kable_styling(full_width = F, position = "left")
+
+
+```
+
+Ensuite je voulais voir quels variables avait des valeurs manquantes 
+
+## Analyse des valeurs manquantes
+```{r Analyse des valeurs manquantes}
+
+
+### Analyse des Valeurs Manquantes 
+# X_train 
+na_summary <- X_train %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "Nb_NA") %>%
+  mutate(Pourcentage = (Nb_NA / nrow(X_train)) * 100) %>%
+  filter(Nb_NA > 0) %>%
+  arrange(desc(Pourcentage))
+
+# Visualisation des données manquantes
+ggplot(na_summary, aes(x = reorder(Variable, Pourcentage), y = Pourcentage)) +
+  geom_bar(stat = "identity", fill = "#e74c3c", width = 0.7) +
+  coord_flip() +
+  theme_minimal() +
+  labs(
+    title = "Variables contenant des valeurs manquantes",
+    subtitle = "Pourcentage de données absentes avant imputation",
+    x = "Variable",
+    y = "% Manquant"
+  ) +
+  geom_text(aes(label = round(Pourcentage, 1)), hjust = -0.2, size = 3)
+
+```
+
+
+J'ai ensuite décidé de procéder à l'imputation des valeurs manquantes
+
+```{r imputations des valeurs manquantes}
+
+# 1. Définition des groupes de variables
+meteo_vars <- c("FR_WINDPOW", "DE_WINDPOW", "FR_TEMP", "DE_TEMP", "FR_RAIN", "DE_RAIN")
+
+exchange_vars <- c("FR_DE_EXCHANGE", "DE_FR_EXCHANGE")
+
+net_vars <- c("FR_NET_IMPORT", "FR_NET_EXPORT", "DE_NET_IMPORT", "DE_NET_EXPORT")
+
+# 2. Imputation METEO (Interpolation linéaire)
+X_train <- X_train %>%
+  mutate(across(
+    any_of(meteo_vars), 
+    ~ na.approx(.x, na.rm = FALSE) 
+  ))
+
+# 3. Imputation ECHANGES (Interpolation linéaire)
+X_train <- X_train %>%
+  mutate(across(
+    any_of(exchange_vars),
+    ~ na.approx(.x, na.rm = FALSE)
+  ))
+
+# 4. Imputation NET FLOWS (Interpolation avec limite de 3 + Rolling Mean)
+X_train <- X_train %>%
+  # Etape A : Interpolation pour les petits trous (maxgap = 3)
+  mutate(across(
+    any_of(net_vars),
+    ~ na.approx(.x, na.rm = FALSE, maxgap = 3)
+  )) %>%
+  # Etape B : Moyenne mobile pour les trous restants
+  mutate(across(
+    any_of(net_vars),
+    ~ ifelse(
+      is.na(.x),
+      rollapply(.x, width = 7, FUN = mean, fill = NA, align = "center", partial = TRUE),
+      .x
+    )
+  ))
+
+# 5. Nettoyage des extrémités (Last Observation Carried Forward / Backward)
+vars_to_clean <- c(meteo_vars, exchange_vars, net_vars)
+
+X_train <- X_train %>%
+  mutate(across(
+    any_of(vars_to_clean),
+    ~ na.locf(.x, na.rm = FALSE)    
+  )) %>%
+  mutate(across(
+    any_of(vars_to_clean),
+    ~ na.locf(.x, fromLast = TRUE, na.rm = FALSE) 
+  ))
+
+# Vérification finale
+print("Valeurs manquantes restantes :")
+print(colSums(is.na(X_train %>% select(any_of(vars_to_clean)))))
+
+
+
+# fusion entre X_train et y_train 
+df_train <- X_train %>%
+  left_join(y_train, by = "ID")
+
+```
+
+
+Après avoir effectué l'imputation des variables. Je voulais voir comment les variables été distribuées (features + target)
+
+
+## Distribution des variables 
+
+
+```{r Distribution des features}
+
+### Matrice des Distributions des Features
+# Sélection des variables numériques (hors ID et Target) pour visualisation
+features_long <- df_train %>%
+  select(-ID, -TARGET) %>%
+  select(where(is.numeric)) %>%
+  pivot_longer(cols = everything(), names_to = "Variable", values_to = "Valeur")
+
+# Visualisation globale
+ggplot(features_long, aes(x = Valeur)) +
+  geom_histogram(bins = 30, fill = "#2c3e50", color = "white", alpha = 0.8) +
+  facet_wrap(~Variable, scales = "free", ncol = 4) +
+  theme_minimal(base_size = 8) +
+  theme(
+    strip.text = element_text(face = "bold"),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank()
+  ) +
+  labs(
+    title = "Vue d'ensemble des distributions des variables explicatives",
+    x = "", y = "Fréquence"
+  )
+
+
+```
+
+
+
+Les distributions des variables explicatives montrent des comportements hétérogènes : les variables de marché et de prix présentent des distributions centrées et quasi symétriques, tandis que les variables météorologiques et de production renouvelable affichent des distributions asymétriques avec des queues marquées, reflétant la non-linéarité et l’intermittence du système électrique.
+
+
+
+
+```{r Distribution de la target}
+
+cols_pays <- c("FR" = "#3498db", "DE" = "#e74c3c")
+
+### Distribution de la Variable Cible (TARGET)
+stats_target <- df_train %>%
+  group_by(COUNTRY) %>%
+  summarise(
+    Moyenne = mean(TARGET),
+    Mediane = median(TARGET),
+    EcartType = sd(TARGET),
+    Min = min(TARGET),
+    Max = max(TARGET)
+  )
+
+print(kable(stats_target, digits = 2, caption = "Statistiques descriptives de la Target"))
+
+# Histogramme + Densité par Pays
+ggplot(df_train, aes(x = TARGET, fill = COUNTRY)) +
+  geom_histogram(aes(y = ..density..), bins = 50, alpha = 0.6, position = "identity", color = "white") +
+  geom_density(alpha = 0, size = 1) +
+  scale_fill_manual(values = cols_pays) +
+  scale_color_manual(values = cols_pays) +
+  theme_minimal() +
+  labs(
+    title = "Distribution des variations de prix (Target)",
+    subtitle = "Comparaison France vs Allemagne",
+    x = "Variation du prix (€/MWh)",
+    y = "Densité"
+  )
+
+
+```
+
+
+Les distributions de prix révèlent une forte hétérogénéité et une volatilité accrue en Allemagne, suggérant des dynamiques de marché distinctes. Cette observation, combinée aux différences structurelles des mix électriques français et allemand, motive une analyse exploratoire comparative visant à mettre en évidence les principaux mécanismes de formation des prix.
+
+
+# Analyse Exploratoire des Données (EDA)
+
+
+```{r PCA}
+# Sélection des variables physiques et économiques
+data_pca <- df_train %>%
+  select(TARGET, FR_CONSUMPTION, FR_WINDPOW, FR_SOLAR, FR_TEMP, 
+         FR_NUCLEAR, GAS_RET, COAL_RET, CARBON_RET,
+         DE_WINDPOW, DE_SOLAR) 
+
+res.pca <- PCA(data_pca, scale.unit = TRUE, graph = FALSE)
+
+fviz_pca_var(res.pca,
+             col.var = "contrib",
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             repel = TRUE,
+             title = "Corrélations Structurelles")
+
+```
+
+Le cercle des corrélations met en évidence une structuration claire du système électrique : la première dimension oppose les énergies renouvelables (éolien, solaire) aux variables de demande et de production pilotable, tandis que la seconde dimension est dominée par les prix des combustibles fossiles, indiquant que la formation des prix résulte de l’interaction entre contraintes physiques et signaux de marché.
+
+
+```{r umap_clustering_data}
+
+df_regime <- df_train %>%
+  filter(COUNTRY %in% c("FR", "DE")) %>%
+  mutate(
+    RENEWABLE = ifelse(COUNTRY == "FR",
+                       FR_WINDPOW + FR_SOLAR,
+                       DE_WINDPOW + DE_SOLAR),
+    
+    CONSUMPTION = ifelse(COUNTRY == "FR",
+                         FR_CONSUMPTION,
+                         DE_CONSUMPTION),
+    
+    RESIDUAL_LOAD = ifelse(COUNTRY == "FR",
+                           FR_RESIDUAL_LOAD,
+                           DE_RESIDUAL_LOAD),
+    
+    RENEW_RATIO = RENEWABLE / (CONSUMPTION + 1e-6),
+    
+    GAS = GAS_RET,
+    COAL = COAL_RET,
+    
+    NET_FLOW = ifelse(COUNTRY == "FR",
+                      FR_NET_IMPORT,
+                      -DE_NET_EXPORT)
+  ) %>%
+  select(
+    COUNTRY,
+    TARGET,
+    RENEW_RATIO,
+    RESIDUAL_LOAD,
+    GAS,
+    COAL,
+    NET_FLOW
+  ) %>%
+  drop_na()
+
+# Standardisation
+X_scaled <- df_regime %>%
+  select(-COUNTRY, -TARGET) %>%
+  scale()
+```
+
+```{r clustering}
+set.seed(123)
+
+# 3 régimes
+k <- 3
+km <- kmeans(X_scaled, centers = k, nstart = 50)
+
+df_regime <- df_regime %>%
+  mutate(
+    Cluster = factor(km$cluster,
+                     labels = c("Régime EnR", "Régime Stress", "Régime Intermédiaire"))
+  )
+
+# Profil économique des clusters
+cluster_summary <- df_regime %>%
+  group_by(Cluster) %>%
+  summarise(
+    Prix_médian = median(TARGET),
+    Surplus_EnR = median(RENEW_RATIO),
+    Charge = median(RESIDUAL_LOAD),
+    Gaz = median(GAS),
+    .groups = "drop"
+  )
+
+cluster_summary
+```
+
+
+```{r umap}
+set.seed(123)
+
+umap_res <- umap(
+  X_scaled,
+  n_neighbors = 25,
+  min_dist = 0.15,
+  metric = "euclidean"
+)
+
+df_umap <- df_regime %>%
+  mutate(
+    UMAP1 = umap_res[,1],
+    UMAP2 = umap_res[,2]
+  )
+```
+
+```{r UMAP coloré}
+ggplot(df_umap, aes(UMAP1, UMAP2, color = Cluster)) +
+  geom_point(alpha = 0.6, size = 2) +
+  theme_minimal(base_size = 13) +
+  labs(
+    title = "Régimes latents du marché électrique européen",
+    subtitle = "Projection UMAP basée sur EnR, charge, énergie fossile et flux",
+    x = "UMAP 1",
+    y = "UMAP 2",
+    color = "Régime de marché"
+  )
+```
+
+La projection UMAP révèle l’existence de trois régimes latents bien distincts du marché électrique européen, correspondant à des situations dominées par les énergies renouvelables, des phases de stress du système et des configurations intermédiaires, confirmant une structuration non linéaire des dynamiques de prix.
+
+
+
+```{r price density by regime}
+
+df_umap <- df_umap %>%
+  mutate(
+    market_regime = factor(
+      Cluster,
+      levels = sort(unique(Cluster)),
+      labels = c(
+        "Régime EnR (surplus)",
+        "Régime intermédiaire",
+        "Régime de stress"
+      )
+    )
+  )
+
+
+df_quant_lines <- df_umap %>%
+  group_by(COUNTRY, market_regime) %>%
+  summarise(
+    q05 = quantile(TARGET, 0.05, na.rm = TRUE),
+    q95 = quantile(TARGET, 0.95, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(
+    cols = c(q05, q95),
+    names_to = "quantile",
+    values_to = "price"
+  )
+
+ggplot(
+  df_umap,
+  aes(x = TARGET, fill = COUNTRY)
+) +
+  
+  geom_density(alpha = 0.45, linewidth = 1) +
+  
+  geom_vline(
+    data = df_quant_lines,
+    aes(xintercept = price),
+    linetype = "dashed",
+    linewidth = 0.7,
+    color = "black"
+  ) +
+  
+  facet_grid(COUNTRY ~ market_regime) +
+  
+  scale_fill_manual(
+    values = c("FR" = "#3498db", "DE" = "#e74c3c"),
+    guide = "none"
+  ) +
+  
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.text.y  = element_blank(),
+    axis.title.y = element_blank(),
+    panel.grid.minor = element_blank()
+  ) +
+  
+  labs(
+    title = "Distribution des prix selon les régimes de marché",
+    x = "Prix de l'électricité"
+  )
+
+
+
+
+
+```
+
+
+
+À la suite de l’identification des régimes latents par UMAP, l’analyse des distributions de prix montre que chaque régime est associé à un profil de risque distinct, avec des prix plus compressés en régime EnR, une dispersion modérée en régime intermédiaire et une volatilité nettement accrue en régime de stress.
+
+
+
+
+
+```{r Matrice des prix France}
+
+data_heatmap <- df_train %>%
+  filter(COUNTRY == "FR") %>%
+  mutate(
+    # On crée 10 tranches pour la Charge Résiduelle et le Gaz
+    Bin_Residual = ntile(FR_RESIDUAL_LOAD, 10),
+    Bin_Gas = ntile(GAS_RET, 10)
+  ) %>%
+  group_by(Bin_Residual, Bin_Gas) %>%
+  summarise(Median_Price = median(TARGET), .groups = "drop")
+
+ggplot(data_heatmap, aes(x = factor(Bin_Residual), y = factor(Bin_Gas), fill = Median_Price)) +
+  geom_tile(color = "white") + # Les cases
+  
+  # Couleurs : Bleu (Prix bas) -> Rouge (Prix haut)
+  scale_fill_gradient2(low = "#3498db", mid = "white", high = "#e74c3c", midpoint = 0) +
+  
+  theme_minimal() +
+  labs(
+    title = "Matrice de Formation des Prix France (Heatmap)",
+    x = "Charge Résiduelle (1=Faible, 10=Forte)",
+    y = "Prix du Gaz (1=Faible, 10=Fort)",
+    fill = "Prix Médian"
+  )
+
+
+
+```
+
+
+
+```{r Matrice des prix Allemagne}
+
+data_heatmap <- df_train %>%
+  filter(COUNTRY == "DE") %>%
+  mutate(
+    # On crée 10 tranches pour la Charge Résiduelle et le Gaz
+    Bin_Residual = ntile(DE_RESIDUAL_LOAD, 10),
+    Bin_Gas = ntile(GAS_RET, 10)
+  ) %>%
+  group_by(Bin_Residual, Bin_Gas) %>%
+  summarise(Median_Price = median(TARGET), .groups = "drop")
+
+ggplot(data_heatmap, aes(x = factor(Bin_Residual), y = factor(Bin_Gas), fill = Median_Price)) +
+  geom_tile(color = "white") + # Les cases
+  
+  # Couleurs : Bleu (Prix bas) -> Rouge (Prix haut)
+  scale_fill_gradient2(low = "#3498db", mid = "white", high = "#e74c3c", midpoint = 0) +
+  
+  theme_minimal() +
+  labs(
+    title = "Matrice de Formation des Prix Allemagne (Heatmap)",
+    x = "Charge Résiduelle (1=Faible, 10=Forte)",
+    y = "Prix du Gaz (1=Faible, 10=Fort)",
+    fill = "Prix Médian"
+  )
+
+
+
+```
+
+
+Ces matrices de formation des prix montrent que, tant en France qu’en Allemagne, les prix augmentent fortement lorsque la charge résiduelle est élevée et que le gaz est cher, avec un effet plus marqué et plus systématique en Allemagne, reflétant une dépendance accrue aux combustibles fossiles dans les situations de tension.
+
+
+
+```{r market_profile_FR_radar}
+
+df_fr <- df_train %>% filter(COUNTRY == "FR")
+
+high_thresh <- quantile(df_fr$TARGET, 0.85, na.rm = TRUE)
+low_thresh  <- quantile(df_fr$TARGET, 0.15, na.rm = TRUE)
+
+features_radar <- c("FR_CONSUMPTION", "FR_WINDPOW", "FR_SOLAR",
+                    "FR_NUCLEAR", "FR_GAS", "FR_HYDRO")
+
+labels_radar <- c("Conso", "Éolien", "Solaire", "Nucléaire", "Gaz", "Hydraulique")
+
+df_norm <- df_fr %>% select(all_of(features_radar))
+df_norm <- as.data.frame(lapply(df_norm, function(x)
+  (x - min(x, na.rm = TRUE)) / (max(x, na.rm = TRUE) - min(x, na.rm = TRUE))
+))
+
+mean_high <- colMeans(df_norm[df_fr$TARGET > high_thresh, ], na.rm = TRUE)
+mean_low  <- colMeans(df_norm[df_fr$TARGET < low_thresh, ], na.rm = TRUE)
+
+radar_data <- data.frame(
+  rbind(
+    max = rep(1, 6),
+    min = rep(0, 6),
+    high = mean_high,
+    low  = mean_low
+  )
+)
+
+colnames(radar_data) <- labels_radar
+
+par(mar = c(1, 2, 2, 1))
+
+radarchart(
+  radar_data,
+  axistype = 1,
+  pcol = c("#E74C3C", "#2ECC71"),
+  pfcol = c(scales::alpha("#E74C3C", 0.3),
+            scales::alpha("#2ECC71", 0.3)),
+  plwd = 3,
+  cglcol = "grey",
+  axislabcol = "grey",
+  caxislabels = seq(0, 1, 0.25),
+  vlcex = 0.8,
+  title = "FRANCE – Profil des jours chers vs pas chers"
+)
+
+legend(
+  "topright",
+  legend = c("Jours chers", "Jours pas chers"),
+  col = c("#E74C3C", "#2ECC71"),
+  pch = 20,
+  pt.cex = 2,
+  bty = "n"
+)
+
+```
+
+
+
+
+```{r market_profile_DE_radar}
+
+
+df_de <- df_train %>% filter(COUNTRY == "DE")
+
+high_thresh <- quantile(df_de$TARGET, 0.85, na.rm = TRUE)
+low_thresh  <- quantile(df_de$TARGET, 0.15, na.rm = TRUE)
+
+features_radar <- c("DE_CONSUMPTION", "DE_WINDPOW", "DE_SOLAR",
+                    "DE_NUCLEAR", "DE_GAS", "DE_HYDRO")
+
+labels_radar <- c("Conso", "Éolien", "Solaire", "Nucléaire", "Gaz", "Hydraulique")
+
+df_norm <- df_de %>% select(all_of(features_radar))
+df_norm <- as.data.frame(lapply(df_norm, function(x)
+  (x - min(x, na.rm = TRUE)) / (max(x, na.rm = TRUE) - min(x, na.rm = TRUE))
+))
+
+mean_high <- colMeans(df_norm[df_de$TARGET > high_thresh, ], na.rm = TRUE)
+mean_low  <- colMeans(df_norm[df_de$TARGET < low_thresh, ], na.rm = TRUE)
+
+
+radar_data <- data.frame(
+  rbind(
+    max = rep(1, 6),
+    min = rep(0, 6),
+    high = mean_high,
+    low  = mean_low
+  )
+)
+
+colnames(radar_data) <- labels_radar
+
+par(mar = c(1, 2, 2, 1))
+
+radarchart(
+  radar_data,
+  axistype = 1,
+  pcol = c("#E74C3C", "#2ECC71"),
+  pfcol = c(scales::alpha("#E74C3C", 0.3),
+            scales::alpha("#2ECC71", 0.3)),
+  plwd = 3,
+  cglcol = "grey",
+  axislabcol = "grey",
+  caxislabels = seq(0, 1, 0.25),
+  vlcex = 0.8,
+  title = "Allemagne – Profil des jours chers vs pas chers"
+)
+
+legend(
+  "topright",
+  legend = c("Jours chers", "Jours pas chers"),
+  col = c("#E74C3C", "#2ECC71"),
+  pch = 20,
+  pt.cex = 2,
+  bty = "n"
+)
+
+```
+
+
+Après avoir identifié les configurations de prix extrêmes via les matrices charge–gaz, cette analyse des profils moyens confirme que les jours chers sont associés à une forte demande, un recours accru aux combustibles fossiles et une moindre contribution des renouvelables, particulièrement en Allemagne.
+
+
+
+```{r Merit Order}
+
+cols_pays <- c("FR" = "#3498db", "DE" = "#e74c3c")
+
+# Préparation des données
+df_merit <- df_train %>%
+  filter(COUNTRY %in% c("FR", "DE")) %>%
+  mutate(RENEWABLE = ifelse(COUNTRY == "FR", FR_WINDPOW + FR_SOLAR, DE_WINDPOW + DE_SOLAR)) %>%
+  group_by(COUNTRY) %>%
+  mutate(RENEW_Q = ntile(RENEWABLE, 4)) %>%
+  ungroup()
+
+# Calcul du résumé (Médiane + Intervalle)
+df_summary2 <- df_merit %>%
+  group_by(COUNTRY, RENEW_Q) %>%
+  summarise(
+    median_price = median(TARGET),
+    q25 = quantile(TARGET, 0.25),
+    q75 = quantile(TARGET, 0.75),
+    .groups = "drop"
+  )
+
+ggplot(df_summary2, aes(x = factor(RENEW_Q), y = median_price, color = COUNTRY, fill = COUNTRY, group = COUNTRY)) +
+  
+  # Zone d'incertitude (Ribbon)
+  geom_ribbon(aes(ymin = q25, ymax = q75), alpha = 0.2, color = NA) +
+  
+  # Ligne et Points
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  
+  # Couleurs et Labels
+  scale_color_manual(values = cols_pays, labels = c("FR" = "France", "DE" = "Allemagne")) +
+  scale_fill_manual(values = cols_pays, labels = c("FR" = "France", "DE" = "Allemagne")) +
+  
+  theme_minimal(base_size = 13) +
+  labs(
+    title = "Impact de la production verte sur les prix",
+    subtitle = "La baisse médiane est comparable, mais l'incertitude est structurellement plus forte en Allemagne",
+    x = "Quartile de Production Renouvelable (1=Faible -> 4=Fort)",
+    y = "Prix Médian (Target)",
+    color = "Pays",
+    fill = "Pays"
+  )
+
+
+```
+
+
+Après avoir caractérisé les profils des jours chers et non chers, l’effet de la production renouvelable confirme un impact baissier sur les prix, comparable en médiane entre la France et l’Allemagne, mais structurellement plus instable en Allemagne. Ce qui était attendu L'allemagne à un poids plus important dans les énergies renouvelables tandis que le nucléaire en France joue un rôle amortisseur dans la variation des prix.
+
+
+
+```{r wind price}
+
+# On prend le vent Français pour la France, et le vent Allemand pour l'Allemagne
+df_fr_clean <- df_train %>% 
+  filter(COUNTRY == "FR") %>%
+  select(TARGET, WIND = FR_WINDPOW) %>%
+  mutate(Pays = "France")
+
+df_de_clean <- df_train %>% 
+  filter(COUNTRY == "DE") %>%
+  select(TARGET, WIND = DE_WINDPOW) %>%
+  mutate(Pays = "Allemagne")
+
+# On fusionne
+df_compare <- rbind(df_fr_clean, df_de_clean)
+
+# 3. Création de paliers (Bins)
+# On découpe le vent en 10 tranches (Déciles) pour chaque pays
+# Tranche 1 = Les 10% des jours ou il y'a le moins de vent 
+# Tranche 10 = Les 10% des jours ou il y' le plus de vent 
+df_summary <- df_compare %>%
+  group_by(Pays) %>%
+  mutate(Wind_Bin = ntile(WIND, 10)) %>% # Découpe en 10 groupes égaux
+  group_by(Pays, Wind_Bin) %>%
+  summarise(
+    Prix_Moyen = mean(TARGET),
+    Prix_Ecart = sd(TARGET)/sqrt(n()) # Pour l'intervalle de confiance
+  )
+
+# 4. Le Graphique de Sensibilité
+ggplot(df_summary, aes(x = Wind_Bin, y = Prix_Moyen, color = Pays, group = Pays)) +
+  
+  geom_line(size = 2) +
+ 
+  geom_point(size = 4) +
+  
+  
+  scale_color_manual(values = c("Allemagne" = "#E74C3C", "France" = "#3498DB")) +
+  scale_x_continuous(breaks = 1:10, labels = c("Calme plat", "2", "3", "4", "5", "6", "7", "8", "9", "Tempête")) +
+  
+  theme_minimal() +
+  labs(
+    title = "Qui est le plus dépendant du vent ?",
+    subtitle = "Comparaison de la chute des prix quand le vent augmente (Déciles)",
+    x = "Niveau de Vent (1 = Faible, 10 = Fort)",
+    y = "Prix Moyen (Standardisé)"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    legend.position = "top"
+  )
+
+
+
+```
+
+
+Par la suite j'ai fais l’analyse de l’impact des énergies renouvelables, cette comparaison montre que l’augmentation du vent entraîne une baisse des prix nettement plus marquée et monotone en Allemagne qu’en France, confirmant une dépendance structurellement plus forte du marché allemand à l’éolien.
+
+
+
+```{r solar price}
+
+# Création d’un tableau unifié 
+df_fr_clean <- df_train %>% 
+  filter(COUNTRY == "FR") %>%
+  select(TARGET, SOLAR = FR_SOLAR) %>%
+  mutate(Pays = "France")
+
+df_de_clean <- df_train %>% 
+  filter(COUNTRY == "DE") %>%
+  select(TARGET, SOLAR = DE_SOLAR) %>%
+  mutate(Pays = "Allemagne")
+
+# Fusion
+df_compare <- bind_rows(df_fr_clean, df_de_clean)
+
+# Création des déciles solaires (par pays)
+df_summary <- df_compare %>%
+  group_by(Pays) %>%
+  mutate(Solar_Bin = ntile(SOLAR, 10)) %>% 
+  group_by(Pays, Solar_Bin) %>%
+  summarise(
+    Prix_Moyen = mean(TARGET),
+    Prix_Ecart = sd(TARGET) / sqrt(n()),
+    .groups = "drop"
+  )
+
+# Graphique de sensibilité solaire
+ggplot(df_summary, aes(x = Solar_Bin, y = Prix_Moyen, color = Pays, group = Pays)) +
+  geom_line(linewidth = 2) +
+  geom_point(size = 4) +
+  
+  scale_color_manual(
+    values = c("Allemagne" = "#E74C3C", "France" = "#3498DB")
+  ) +
+  
+  scale_x_continuous(
+    breaks = 1:10,
+    labels = c("Nuit", "2", "3", "4", "5", "Midi", "7", "8", "9", "Soleil max")
+  ) +
+  
+  theme_minimal(base_size = 13) +
+  labs(
+    title = "Qui est le plus dépendant du solaire ?",
+    subtitle = "Comparaison de la variation des prix quand la production solaire augmente (Déciles)",
+    x = "Niveau de production solaire (1 = faible, 10 = élevé)",
+    y = "Prix moyen de l'électricité",
+    color = "Pays"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    legend.position = "top"
+  )
+
+```
+
+
+Dans la continuité de l’analyse du vent, ce graphique montre que l’effet du solaire sur les prix est plus faible et moins monotone que celui de l’éolien, avec une sensibilité plus marquée en Allemagne qu’en France, mais sans rôle structurant comparable à celui du vent.
+
+
+
+```{r negative_price_threshold}
+
+# Création de l'indicateur de surplus renouvelable
+df_neg <- df_train %>%
+  mutate(
+    renew_ratio = ifelse(
+      COUNTRY == "FR",
+      (FR_WINDPOW + FR_SOLAR) / FR_CONSUMPTION,
+      (DE_WINDPOW + DE_SOLAR) / DE_CONSUMPTION
+    ),
+    price_negative = TARGET < 0
+  )
+
+# Winsorisation (1% - 99%)
+q_low  <- quantile(df_neg$renew_ratio, 0.01, na.rm = TRUE)
+q_high <- quantile(df_neg$renew_ratio, 0.99, na.rm = TRUE)
+
+df_neg <- df_neg %>%
+  mutate(
+    renew_ratio_w = pmin(pmax(renew_ratio, q_low), q_high)
+  )
+
+# Discrétisation en régimes (tertiles)
+df_neg <- df_neg %>%
+  group_by(COUNTRY) %>%
+  mutate(
+    renew_regime = ntile(renew_ratio_w, 3),
+    renew_regime = factor(
+      renew_regime,
+      levels = c(1, 2, 3),
+      labels = c(
+        "Surplus EnR faible",
+        "Surplus EnR modéré",
+        "Surplus EnR élevé"
+      )
+    )
+  ) %>%
+  ungroup()
+
+
+df_neg_summary <- df_neg %>%
+  group_by(COUNTRY, renew_regime) %>%
+  summarise(
+    prob_negative = mean(price_negative),
+    n_obs = n(),
+    .groups = "drop"
+  )
+
+
+ggplot(df_neg_summary,
+       aes(x = renew_regime, y = prob_negative, color = COUNTRY, group = COUNTRY)) +
+  
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  
+  scale_color_manual(
+    values = c("FR" = "#3498db", "DE" = "#e74c3c"),
+    labels = c("FR" = "France", "DE" = "Allemagne")
+  ) +
+  
+  theme_minimal(base_size = 13) +
+  labs(
+    title = "Bascule vers les prix négatifs",
+    subtitle = "Probabilité conditionnelle d’un prix négatif selon le régime de surplus renouvelable",
+    x = "Régime de surplus renouvelable",
+    y = "P(Prix < 0)",
+    color = "Pays"
+  )
+
+
+
+
+
+```
+
+
+Dans le prolongement des analyses précédentes, ce graphique montre que l’augmentation du surplus renouvelable accroît fortement la probabilité de prix négatifs, un effet particulièrement marqué en Allemagne, confirmant une sensibilité structurelle plus élevée aux excédents d’EnR.
+
+---
+
+
+
+
+# Feature Engineering
+
+Les données brutes ne suffisent pas à capturer la non-linéarité des prix de l'électricité (ex: les prix explosent de manière exponentielle et non linéaire lors des pics de froid). Nous avons donc enrichi le jeu de données avec les variables suivantes :
+
+1.  **Transformations Non-Linéaires** : Ajout du carré des températures (`TEMP^2`) pour capter l'effet non-linéaire du chauffage en hiver et de la climatisation en été.
+2.  **Ratios Physiques** : Calcul de la part des énergies renouvelables (`RENEW_RATIO`) qui influence la probabilité de prix négatifs.
+3.  **Interactions Économiques** : Création de variables d'interaction (ex: `THERMAL_STRESS`) modélisant le coût marginal de production. Selon la théorie du *Merit Order*, le prix est fixé par la dernière centrale appelée (souvent gaz ou charbon).
+4. **Dynamiques Temporelles** : Intégration de variables de retard (lags $t-1$, $t-2$, $t-24$) et de statistiques glissantes sur 24h pour capturer l'inertie et la volatilité des prix.
+
+
+```{r feature_engineering_temporal}
+
+
+df_train <- df_train %>%
+  group_by(COUNTRY) %>%
+  arrange(DAY_ID) %>%
+  mutate(
+    target_lag1  = lag(TARGET, 1),
+    target_lag2  = lag(TARGET, 2),
+    target_lag24 = lag(TARGET, 24),
+    roll_mean_24 = zoo::rollmean(TARGET, 24, fill = NA, align = "right"),
+    roll_sd_24   = zoo::rollapply(TARGET, 24, sd, fill = NA, align = "right")
+  ) %>%
+  ungroup()
+```
+
+
+```{r feature engineering classique}
+
+# Fonctions de selection et création de variables pour la France et l'Allemagne
+select_features_de <- function(df) {
+  df %>% select(TARGET, starts_with("DE_"), GAS_RET, COAL_RET, CARBON_RET,
+                target_lag1, target_lag2, target_lag24,
+                roll_mean_24, roll_sd_24) %>%
+    select(-DE_WIND, -DE_RAIN, -DE_NET_EXPORT, -DE_FR_EXCHANGE)
+}
+
+select_features_fr <- function(df) {
+  df %>% select(TARGET, starts_with("FR_"), GAS_RET, COAL_RET, CARBON_RET,
+                DE_WINDPOW, DE_SOLAR, DE_CONSUMPTION, DE_NET_IMPORT, DE_RESIDUAL_LOAD,
+                target_lag1, target_lag2, target_lag24,
+                roll_mean_24, roll_sd_24) %>%
+    select(-FR_WIND, -FR_RAIN, -FR_NET_EXPORT, -FR_DE_EXCHANGE)
+}
+
+#Creation des variables non linéaires
+add_nonlinear_features <- function(df, country) {
+  epsilon <- 1e-5 
+  if (country == "FR") {
+    df <- df %>% mutate(
+      FR_TEMP_sq = FR_TEMP^2,
+      FR_THERMAL_STRESS = FR_RESIDUAL_LOAD * GAS_RET,
+      FR_RENEW_RATIO = (FR_WINDPOW + FR_SOLAR) / (FR_CONSUMPTION + epsilon),
+      FR_HEATING_NEED = pmax(0, 15 - FR_TEMP)
+    )
+  } else {
+    df <- df %>% mutate(
+      DE_TEMP_sq = DE_TEMP^2,
+      DE_THERMAL_STRESS = DE_RESIDUAL_LOAD * COAL_RET,
+      DE_RENEW_RATIO = (DE_WINDPOW + DE_SOLAR) / (DE_CONSUMPTION + epsilon)
+    )
+  }
+  return(df)
+}
+
+# Application du pipeline pour la France et l'Allemagne
+train_fr_final <- df_train %>%
+  filter(COUNTRY == "FR") %>%
+  select_features_fr() %>%
+  add_nonlinear_features("FR")
+
+train_de_final <- df_train %>%
+  filter(COUNTRY == "DE") %>%
+  select_features_de() %>%
+  add_nonlinear_features("DE")
+```
+
+
+
+# Feature selection
+
+Ce code définit une fonction de nettoyage qui optimise les jeux de données français et allemand en supprimant les variables à variance quasi nulle et celles présentant une forte multicolinéarité. Cette procédure permet de réduire la dimensionnalité et d'améliorer la stabilité des futurs modèles d'entraînement en ne conservant que les prédicteurs les plus pertinents.
+
+
+```{r feature selection}
+
+# Fonction générique de nettoyage avant entraînement
+clean_features_pre_training <- function(df, target_col = "TARGET", corr_thresh = 0.8) {
+  
+  cat(paste("--- Nettoyage :", deparse(substitute(df)), "---\n"))
+  cat("Nombre de variables initial :", ncol(df), "\n")
+  
+  # 1. Séparer Target et Features
+  y <- df[[target_col]]
+  X <- df %>% select(-all_of(target_col))
+  
+  # 2. Suppression des variables à variance nulle (qui ne changent jamais)
+  nzv <- nearZeroVar(X)
+  if (length(nzv) > 0) {
+    cat("Variables à variance nulle supprimées :", names(X)[nzv], "\n")
+    X <- X[, -nzv]
+  }
+  
+  # 3. Suppression de la Multicolinéarité (Redondance entre features)
+  # On calcule la matrice de corrélation entre les variables explicatives seulement
+  corr_mat <- cor(X, use = "pairwise.complete.obs", method = "spearman")
+  
+  # findCorrelation renvoie les indices des colonnes à supprimer
+  high_corr_idx <- findCorrelation(corr_mat, cutoff = corr_thresh)
+  
+  if (length(high_corr_idx) > 0) {
+    removed_vars <- names(X)[high_corr_idx]
+    cat("Variables trop corrélées supprimées (> ", corr_thresh, ") :\n")
+    print(removed_vars)
+    X <- X[, -high_corr_idx]
+  }
+  
+  # 4. Reconstruction du DataFrame propre
+  df_clean <- bind_cols(X, TARGET = y)
+  
+  cat("Nombre de variables final :", ncol(df_clean), "\n\n")
+  return(df_clean)
+}
+
+# --- APPLICATION AUX DEUX PAYS ---
+train_fr_selected <- clean_features_pre_training(train_fr_final, corr_thresh = 0.80)
+train_de_selected <- clean_features_pre_training(train_de_final, corr_thresh = 0.80)
+
+```
+
+
+# Modelisation XGBOOST 
+
+
+Ce code implémente une optimisation par recherche aléatoire combinée à une validation croisée à 5 folds pour ajuster les hyperparamètres des modèles XGBoost pour la France et l'Allemagne. 
+En utilisant une transformation par rangs des cibles, l'algorithme maximise spécifiquement la corrélation de Spearman, garantissant ainsi une performance robuste et généralisable avant de ré-entraîner le modèle final sur l'intégralité des données.
+
+```{r XGBOOST}
+# ============================================================
+# XGBOOST AVEC CROSS-VALIDATION (5 FOLDS)
+# ============================================================
+
+run_xgb_cv_tuning <- function(df_train, country_name, n_iter = 20, k_folds = 5) {
+  
+  cat(paste("\n=== Démarrage Tuning CV (", k_folds, "folds) pour", country_name, "===\n"))
+  
+  # 1. Création des Folds (Indices)
+  set.seed(123)
+  folds <- createFolds(df_train$TARGET, k = k_folds, list = TRUE)
+  
+  best_avg_score <- -1
+  best_params <- list()
+  best_fold_scores <- numeric(k_folds)
+  
+  # 2. Random Search
+  for (i in 1:n_iter) {
+    
+    # Listes de paramètres
+    params <- list(
+      booster          = "gbtree",
+      objective        = "reg:squarederror",
+      eta              = runif(1, 0.01, 0.1),
+      max_depth        = sample(4:12, 1),
+      subsample        = runif(1, 0.6, 1.0),
+      colsample_bytree = runif(1, 0.6, 1.0),
+      min_child_weight = sample(1:10, 1)
+    )
+    
+    # Stockage des scores 
+    current_fold_scores <- numeric(k_folds)
+    
+    # 3. Boucle Cross-Validation
+    for (j in 1:k_folds) {
+      # Indices pour ce fold
+      val_idx <- folds[[j]]
+      
+      # Séparation 
+      train_fold <- df_train[-val_idx, ]
+      val_fold   <- df_train[val_idx, ]
+      
+      dtrain <- xgb.DMatrix(data = as.matrix(train_fold %>% select(-TARGET)), 
+                            label = rank(train_fold$TARGET)) # Ranking Trick pour la corrélation de spearman 
+      dval   <- xgb.DMatrix(data = as.matrix(val_fold %>% select(-TARGET)), 
+                            label = val_fold$TARGET)        
+      
+      # Entraînement 
+      model <- xgb.train(params = params, data = dtrain, nrounds = 500, 
+                         early_stopping_rounds = 20, watchlist = list(val=dval), verbose = 0)
+      
+      # Score Spearman 
+      preds <- predict(model, dval)
+      current_fold_scores[j] <- cor(val_fold$TARGET, preds, method = "spearman")
+    }
+    
+    # Moyenne des 5 folds
+    avg_score <- mean(current_fold_scores)
+    
+    # Si c'est le meilleur set de paramètres, on sauvegarde
+    if (avg_score > best_avg_score) {
+      best_avg_score <- avg_score
+      best_params <- params
+      best_fold_scores <- current_fold_scores
+      
+      # Affichage compact pour le suivi
+      cat(paste0("Iter ", i, " [New Best]: Moyenne=", round(avg_score, 4), 
+                 " | Std=", round(sd(current_fold_scores), 4), "\n"))
+    }
+  }
+  
+  # 4. Affichage Détaillé Final
+  cat("\n------------------------------------------------------------\n")
+  cat(paste("RÉSULTATS FINAUX CV -", country_name, "\n"))
+  cat("Scores par Fold : ", paste(round(best_fold_scores, 4), collapse = " | "), "\n")
+  cat("Moyenne Globale : ", round(best_avg_score, 4), "\n")
+  cat("Écart-type (Std): ", round(sd(best_fold_scores), 4), "\n")
+  cat("------------------------------------------------------------\n")
+  
+  # 5. Ré-entraînement Final (Refit)
+  # On entraîne un modèle unique sur 100% des données avec les meilleurs paramètres
+  # pour pouvoir faire l'interprétation des facteurs ensuite.
+  cat("Ré-entraînement du modèle final sur l'ensemble des données...\n")
+  
+  ddf_train <- xgb.DMatrix(data = as.matrix(df_train %>% select(-TARGET)), 
+                             label = rank(df_train$TARGET))
+  
+  final_model <- xgb.train(params = best_params, data = ddf_train, nrounds = 600, verbose = 0)
+  
+  return(list(model = final_model, score = best_avg_score, fold_scores = best_fold_scores, std = sd(best_fold_scores)))
+}
+
+# Lancement avec CV 
+res_fr <- run_xgb_cv_tuning(train_fr_selected, "France", n_iter = 50, k_folds = 5)
+res_de <- run_xgb_cv_tuning(train_de_selected, "Allemagne", n_iter = 50, k_folds = 5)
+
+# Création du tableau de résultats pour le rapport
+results_cv <- data.frame(
+  Pays = c("France", "Allemagne"),
+  Moyenne_Spearman = c(res_fr$score, res_de$score),
+  Ecart_Type = c(res_fr$std, res_de$std),
+  Fold_1 = c(res_fr$fold_scores[1], res_de$fold_scores[1]),
+  Fold_2 = c(res_fr$fold_scores[2], res_de$fold_scores[2]),
+  Fold_3 = c(res_fr$fold_scores[3], res_de$fold_scores[3]),
+  Fold_4 = c(res_fr$fold_scores[4], res_de$fold_scores[4]),
+  Fold_5 = c(res_fr$fold_scores[5], res_de$fold_scores[5])
+)
+
+kable(results_cv, caption = "Performance Détaillée (Cross-Validation 5 Folds)", digits = 4) %>%
+  kable_styling(full_width = F)
+
+```
+
+
+XGBoost capture plus efficacement la dynamique des prix en Allemagne qu’en France, en cohérence avec la structure plus instable et renouvelable du marché allemand.
+
+
+
+
+
+```{r feature_importance}
+# Extraction de l'importance des variables pour la France
+importance_matrix_fr <- xgb.importance(model = res_fr$model)
+
+xgb.ggplot.importance(importance_matrix_fr, top_n = 15) +
+  theme_minimal() +
+  labs(title = "XGBoost - Importance des Variables (France)",
+       subtitle = "Le prix du Gaz et du Carbone dominent la formation des prix")
+
+
+# Extraction de l'importance des variables pour l'Allemagne
+importance_matrix_de <- xgb.importance(model = res_de$model)
+
+xgb.ggplot.importance(importance_matrix_de, top_n = 15) +
+  theme_minimal() +
+  labs(title = "XGBoost - Importance des Variables (Allemagne)",
+       subtitle = "Le prix du Gaz et du Carbone dominent la formation des prix")
+
+```
+
+
+Les importances XGBoost mettent en évidence deux logiques de formation des prix distinctes : en France, les prix sont principalement pilotés par les coûts des combustibles et du carbone, tandis qu’en Allemagne, les contraintes physiques du système, notamment l’éolien, la charge résiduelle et les flux, jouent un rôle prépondérant, confirmant une dépendance structurelle aux énergies renouvelables.
+
+
+
+
